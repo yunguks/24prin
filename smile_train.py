@@ -1,7 +1,6 @@
 import torch
 import torchvision
 from torchvision import transforms
-import torch.utils.data as data
 import os
 from PIL import Image
 from torch.utils.data import Dataset
@@ -13,9 +12,10 @@ import random
 from rdkit import Chem
 import torch.nn.functional as F
 from itertools import chain
-import matplotlib.pyplot as plt
-
+from models.model import RNNDecoder, CNNEncoder, RNNDecoderWithATT
+import argparse
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+
 
 def manual_seed(seed):
     np.random.seed(seed) #1
@@ -84,8 +84,9 @@ class SMILES_dataset(Dataset):
             file_name = 'val_100.csv'
     
         data = pd.read_csv(os.path.join(data_path, file_name))
-        self.tokenizer = tokenizer
+        data = data.dropna(subset=['pIC50'])
         
+        self.tokenizer = tokenizer
         
         self.feature = feature
         if feature:
@@ -95,7 +96,8 @@ class SMILES_dataset(Dataset):
         else:    
             self.imgs = (data_path+'/image/'+data.file_name).to_numpy()
         self.smiles = self.tokenizer.txt2seq(data.SMILES)
-        self.labels = data[['pIC50', 'num_atoms', 'logP']].to_numpy()
+        #self.labels = data[['pIC50', 'num_atoms', 'logP']].to_numpy()
+        self.labels = data[['logP']].to_numpy()
         
     
     def __len__(self):
@@ -114,282 +116,32 @@ class SMILES_dataset(Dataset):
             'label' : torch.tensor(self.labels[i], dtype=torch.float32)
         }
 
-###################################MODEL######################################################
-
-class Bottleneck(nn.Module):
-    # Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
-    # while original implementation places the stride at the first 1x1 convolution(self.conv1)
-    # according to "Deep residual learning for image recognition" https://arxiv.org/abs/1512.03385.
-    # This variant is also known as ResNet V1.5 and improves accuracy according to
-    # https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch.
-
-    expansion = 4
-
-    def __init__(
-        self,
-        inplanes,
-        planes,
-        stride = 1,
-        downsample = None,
-        groups = 1,
-        base_width = 64,
-        dilation = 1,
-        norm_layer = None,
-    ) -> None:
-        super().__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        width = int(planes * (base_width / 64.0)) * groups
-        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
-        self.conv1 = nn.Conv2d(inplanes, width, kernel_size=1, stride=1, bias=False)
-        self.bn1 = norm_layer(width)
-        self.conv2 = nn.Conv2d(width, width,kernel_size=3,stride= stride, padding=dilation , groups=groups, dilation = dilation, bias=False)
-        self.bn2 = norm_layer(width)
-        self.conv3 = nn.Conv2d(width, planes * self.expansion, kernel_size=1, bias=False)
-        self.bn3 = norm_layer(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-
-        return out
+def get_args():
+    parser = argparse.ArgumentParser(description="Smiles training")
     
-class feature_extract(nn.Module):
-    def __init__(self,dim=2048,in_size=7,out_size=10, rate=0.3):
-        super(feature_extract, self).__init__()
-        # self.conbvn = nn.Sequential(
-        #     nn.Conv2d(dim,dim,3,1,1),
-        #     nn.BatchNorm2d(dim),
-        #     nn.ReLU(),
-        #     nn.Dropout2d(rate),
-        #     nn.Conv2d(dim,dim,3,1,1),
-        #     nn.BatchNorm2d(dim),
-        #     nn.ReLU(),
-        # )
-        self.dilation = 1
-        self.inplanes = 2048
-        self.groups = 1
-        self.base_width = 64
-        
-        self.conbvn = self._make_layer(Bottleneck, 512, 3, stride=1, dilate=False)
-        
-        self.avgpool = nn.AdaptiveAvgPool2d((10,10))
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+    ## model
+    parser.add_argument('--att', action='store_true', help='Using attetion module')
+    parser.add_argument('--teacher', action='store_true', help='Using teacher forcing')
+    parser.add_argument('--feature', action='store_true', help='Using Wide-ResNet101 feature extract')
+    parser.add_argument('--emb_dim', type=int, default=512)
+    parser.add_argument('--enc_dim', type=int, default=512)
+    parser.add_argument('--coin', action='store_true', help='Using coin flip in teacher forcing')
     
-    def _make_layer(
-        self,
-        block,
-        planes,
-        blocks,
-        stride = 1,
-        dilate = False,
-    ) -> nn.Sequential:
-        norm_layer = nn.BatchNorm2d
-        downsample = None
-        previous_dilation = self.dilation
-        if dilate:
-            self.dilation *= stride
-            stride = 1
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride = stride),
-                nn.BatchNorm2d(planes * block.expansion),
-            )
-
-        layers = []
-        layers.append(
-            block(
-                self.inplanes, planes, stride, downsample, self.groups, self.base_width, previous_dilation, norm_layer
-            )
-        )
-        self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(
-                block(
-                    self.inplanes,
-                    planes,
-                    groups=self.groups,
-                    base_width=self.base_width,
-                    dilation=self.dilation,
-                    norm_layer=norm_layer,
-                )
-            )
-
-        return nn.Sequential(*layers)
+    # train
+    parser.add_argument('--batch', type=int, default=64)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--max_len', type=int, default=102)
+    parser.add_argument('--epoch', type=int, default=100)
     
-    def forward(self,x):
-        add_x = x
-        
-        x = add_x + self.conbvn(x)
-        # x = self.avgpool(x)
-        return x
-
-
-# CNN Encoder Module
-class CNN_Encoder(nn.Module):
-    def __init__(self, encoder_dim, rate, feature=False, max_len=102):
-        super(CNN_Encoder, self).__init__()
-        self.feature = feature
-        if feature:
-            self.backbone = feature_extract()
-        else:
-            model = torchvision.models.resnet101(pretrained=MODEL_PRETRAIN) # UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
-            modules = list(model.children())[:-2]
-            self.backbone = nn.Sequential(*modules)
-        
-        self.dropout1 = nn.Dropout(rate)
-        self.fc = nn.Linear(2048, encoder_dim)
-        
-    def forward(self, x):
-        x = self.backbone(x) # [batch, 2048, 7, 7]
-        x = x.view(x.size(0), 2048, -1) # [64, 2048, 49]
-        x = x.permute(0,2,1)
-        # x = x.mean(dim=1) # [batch, 2048, 1]
-        x = self.fc(x) # [batch, 2048, embedding_dim]
-        x = self.dropout1(x)
-        return x 
+    # data
+    parser.add_argument('--data_path', type=str, default='./kaggle_data')
+    
+    # util
+    parser.add_argument('--save_pth', type=str, default='./checkpoint')
+    parser.add_argument('--result_path', type=str, default='result')
     
     
-class Attention(nn.Module):
-    """
-    Attention network for calculate attention value
-    """
-    def __init__(self, encoder_dim, decoder_dim, attention_dim):
-        """
-        :param encoder_dim: input size of encoder network
-        :param decoder_dim: input size of decoder network
-        :param attention_dim: input size of attention network
-        """
-        super(Attention, self).__init__()
-        self.encoder_att = nn.Linear(encoder_dim, attention_dim)  # linear layer to transform encoded image
-        self.decoder_att = nn.Linear(decoder_dim, attention_dim)  # linear layer to transform decoder's output
-        self.full_att = nn.Linear(attention_dim, 1)  # linear layer to calculate values to be softmax-ed
-        self.relu = nn.ReLU()
-        self.softmax = nn.Softmax(dim=1)  # softmax layer to calculate weights
-
-    def forward(self, encoder_out, decoder_hidden):
-        att1 = self.encoder_att(encoder_out)  # (batch_size, num_pixels, encoder_dim)
-        att2 = self.decoder_att(decoder_hidden)  # (batch_size, attention_dim)
-        
-        score = torch.relu(att1+att2.unsqueeze(1))
-        
-        att = F.softmax(self.full_att(score).squeeze(-1), dim=1) # (batch, pixel size)
-        
-        context_vector = att.unsqueeze(-1) * encoder_out # (batch, pixel, encoder_dim)
-        context_vector = context_vector.sum(dim=1) # (batch, encoder_dim)
-
-        return context_vector, att
-
-# RNN Decoder Module
-class RNN_Decoder(nn.Module):
-    """_summary_
-    LSTM input : ( N, L, H ) in when batch_first=True
-        output : ( N, L, D*Hout ) when batch_first=True
-    N=BATCH
-    L=MAX_LENGTH
-    Hout = voca_size
-    
-    """
-    def __init__(self, voca_size, embedding_dim, max_len, num_layers, rate, encoder_dim=2048):
-        super(RNN_Decoder, self).__init__()
-        self.embedding = nn.Embedding(voca_size, embedding_dim)
-        self.max_len = max_len
-        self.voca_size = voca_size
-        self.lstm = nn.LSTM(embedding_dim+encoder_dim, embedding_dim, num_layers, batch_first=True,dropout=rate, bidirectional=False)
-        
-        self.init_h = nn.Linear(encoder_dim, embedding_dim)  # linear layer to find initial hidden state of LSTMCell
-        self.init_c = nn.Linear(encoder_dim, embedding_dim)  # linear layer to find initial cell state of LSTMCell
-        
-        self.dropout = nn.Dropout(rate)
-        
-        self.emb2voca = nn.Linear(embedding_dim, voca_size) # linear layer to voca size from embedding_dim
-        
-        self.attention = Attention(encoder_dim, embedding_dim, embedding_dim)
-        
-
-    def forward(self, enc_out, dec_in, training=True): # [batch, embedding], [batch, max_len]
-        hidden = self.init_h(enc_out.mean(dim=1)) # [batch, embedding_dim]
-        cell_state = self.init_c(enc_out.mean(dim=1)) # [batch, embedding_dim]
-        
-        embedding = self.embedding(dec_in) # [batch, max_len, embedding_dim]
-        input = embedding[:,0,:]
-        
-        out_list = []
-        atts = []
-        for i in range(self.max_len):
-                
-            context_vector, att = self.attention(enc_out, hidden) # [batch, embedding_dim] # [batch, pixel size]
-            input = torch.cat([context_vector, input], dim=1) # [batch,  encoder+dim+embedding_dim]
-            
-            output, (hidden, cell_state) = self.lstm(input.unsqueeze(1), (hidden.unsqueeze(0),cell_state.unsqueeze(0))) # hidden in: (batch, dim)
-            hidden = hidden.squeeze(0)
-            cell_state = cell_state.squeeze(0)
-            
-            
-            output = self.dropout(output)
-            output = self.emb2voca(output) # hiiden [batch, 1, voca_size]
-
-            if training == True:
-                # next input 
-                
-                if random.random() > 0.5:
-                    input = self.embedding(torch.argmax(output.squeeze(1), -1))
-                else:
-                    input = embedding[:,i,:]
-                    
-                # input = embedding[:,i,:]
-            else:
-                input = self.embedding(torch.argmax(output.squeeze(1), -1))
-                
-                
-            out_list.append(output.squeeze(1))
-            atts.append(att)
-            
-        outputs = torch.stack(out_list,dim=1)
-        atts = torch.stack(atts,dim=1)
-        return outputs, att
-        
-
-class Model(nn.Module):
-    def __init__(self,encoder, decoder, device='cuda'):
-        super(Model, self).__init__()
-        
-        self.encoder = encoder
-        self.decoder = decoder
-        self.encoder_output = None
-        self.device = device
-        
-    def forward(self,x, dec_in, training=True):
-        latent = encoder(x)
-        self.encoder_output = latent
-
-        
-        output = decoder(latent, dec_in, training)
-        return output
+    return parser.parse_args()
 
 def is_smiles(sequence):
     """
@@ -402,26 +154,36 @@ def is_smiles(sequence):
 
 if __name__ == "__main__":
     
+    args = get_args()
+    print(args)
+    
     manual_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
     
-    BATCH_SIZE = 64
+    BATCH_SIZE = args.batch
     MODEL_PRETRAIN = True
-    EPOCHS = 100
+    EPOCHS = args.epoch
     NUM_LAYERS = 1
     dropout_rate = 0.3
-    EMBEDDING_DIM = 512
-    ENCODER_DIM = 512
-    LR = 1e-4
-    vision_pretrain = True
-    DATA_PATH = "./kaggle_data"
+    EMBEDDING_DIM = args.emb_dim
+    ENCODER_DIM = args.enc_dim
+    LR = args.lr
+    DATA_PATH = args.data_path
     TRAIN_CSV_PATH = os.path.join(DATA_PATH, "train_100.csv")
-    MAX_LEN = 102
-    SAVE_PATH = f'./models/best_model.pt'
+    MAX_LEN = args.max_len
+    SAVE_PATH = args.save_pth
+    FEATURE = args.feature
     
-    FEATURE = True
-    
+    save_name = 'result'
+    if args.att:
+        save_name +='_att'
+    if args.teacher:
+        save_name +='_teacher'
+    if args.feature:
+        save_name +='_feature'
+    if args.coin:
+        save_name +='_coin'
     
     ### make tokenizer
     train_pd = pd.read_csv(TRAIN_CSV_PATH)
@@ -442,19 +204,18 @@ if __name__ == "__main__":
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size= BATCH_SIZE, shuffle=False, drop_last=True)
     
     # model
-    encoder = CNN_Encoder(encoder_dim=ENCODER_DIM, rate=dropout_rate, feature=FEATURE, max_len=MAX_LEN)
-    decoder = RNN_Decoder(voca_size=voca_size, embedding_dim=EMBEDDING_DIM, max_len=MAX_LEN, num_layers=NUM_LAYERS, rate=dropout_rate, encoder_dim=ENCODER_DIM)
+    encoder = CNNEncoder(encoder_dim=ENCODER_DIM, rate=dropout_rate, feature=FEATURE, max_len=MAX_LEN)
+    if args.att:
+        print("Using Attention Module")
+        decoder = RNNDecoderWithATT
+    else:
+        decoder = RNNDecoder
+    decoder = decoder(voca_size=voca_size, embedding_dim=EMBEDDING_DIM, max_len=MAX_LEN, num_layers=NUM_LAYERS, rate=dropout_rate, encoder_dim=ENCODER_DIM)
     
     # # optimizer and loss
-            
-    # optim_group = []
-    # optim_group.append({'params': encoder.parameters(), 'lr': LR})
-    # optim_group.append({'params': decoder.parameters(), 'lr': LR})
     combined_parameters = chain(encoder.parameters(), decoder.parameters())
                 
-    # optim = torch.optim.AdamW(model.parameters(), lr=1e-5)
     optimizer = torch.optim.Adam(combined_parameters, lr=LR)
-    
     
     smiles_criterion = nn.CrossEntropyLoss()
     labels_criterion = nn.MSELoss()
@@ -485,7 +246,7 @@ if __name__ == "__main__":
             dec_in = smiles
             
             enc_out = encoder(imgs)
-            smiles_outs, alphas  = decoder(enc_out, dec_in,training=False)
+            smiles_outs, atts  = decoder(enc_out, dec_in,training=False)
             
             smiles_loss = smiles_criterion(smiles_outs.view(-1, voca_size), smiles.view(-1))
             
@@ -493,7 +254,7 @@ if __name__ == "__main__":
             
             loss = smiles_loss
             # Add doubly stochastic attention regularization
-            loss += ((1. - alphas.sum(dim=1)) ** 2).mean()
+            loss += ((1. - atts.sum(dim=1)) ** 2).mean()
         
             train_loss += loss.detach().item()
             optimizer.zero_grad()
@@ -571,18 +332,20 @@ if __name__ == "__main__":
                         'encoder_state_dict' : encoder.state_dict(),
                         'decoder' : decoder,
                         'decoder_state_dict' : decoder.state_dict(),
+                        'epoch' : epoch
                     }
-                torch.save(save_checkpoint, f'./checkpoint/best.pth')
+                torch.save(save_checkpoint, f'{os.path.join(args.save_pth, save_name)+"_best.pth"}')
                 print(f"save best model.")
-            
+    
     # last model save
     save_checkpoint = {
             'encoder' : encoder,
             'encoder_state_dict' : encoder.state_dict(),
             'decoder' : decoder,
             'decoder_state_dict' : decoder.state_dict(),
+            'epoch' : epoch
         }
-    torch.save(save_checkpoint, f'./checkpoint/last.pth')
+    torch.save(save_checkpoint,f'{os.path.join(args.save_pth, save_name)+"_last.pth"}')
     print(f"save last model.")  
     
     result = {
@@ -591,7 +354,14 @@ if __name__ == "__main__":
         'train_loss' : train_loss_per_epoch,
         'val_loss' : val_loss_per_epoch
     }
-    dataframe = pd.DataFrame(result,'train_result_no_teacher_05_17.csv')
-    with open('train_loss_plot_no_teacher_05_17.csv', 'a') as file:
+    result_path = args.result_path
+    if not os.path.exists(result_path):
+        os.mkdir(result_path)
+    
+    result_name = save_name + '.csv'
+    result_name = os.path.join(result_path, result_name)
+    
+    dataframe = pd.DataFrame(result)
+    with open(result_name, 'a') as file:
         for i in range(len(train_acc_per_epoch)):
             file.write(f'{i},{train_acc_per_epoch[i]},{val_acc_per_epoch[i]},{train_loss_per_epoch[i]}\n')
